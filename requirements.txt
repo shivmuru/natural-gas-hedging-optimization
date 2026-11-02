@@ -1,0 +1,6 @@
+gurobipy>=11.0
+pandas>=2.0
+numpy>=1.24
+xlrd>=2.0
+openpyxl>=3.1
+matplotlib>=3.7

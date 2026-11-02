@@ -1,1 +1,135 @@
-# natural-gas-hedging-optimization
+# Natural Gas Winter Hedging Optimization
+
+**Team 28** · Shivani Murugapiran, Jake Deleray, James Wu, Yingshan Zhang, Jiayue Du
+
+On October 1, a U.S. gas utility has to decide **what share of each winter month's expected demand (November to February) to lock in at NYMEX futures prices**. The rest of its demand is bought at the Henry Hub spot price. Homes and businesses must be heated whatever gas costs, so the utility can't simply buy less when prices spike. The goal is a hedge that **keeps the expected winter cost low without leaving the utility badly exposed in a high-price winter**.
+
+`gurobi.py` builds and solves this as a scenario-based linear program in Gurobi, for two service territories with very different sizes: **Texas** (the largest U.S. gas consumer) and **Vermont** (the smallest in the contiguous U.S.).
+
+---
+
+## Quick start
+
+```bash
+pip install -r requirements.txt          # gurobipy ships with a free size-limited license, enough for this model
+python gurobi.py                         # Texas and Vermont, baseline settings
+```
+
+On its first run, the script downloads two things and caches them in `data/`:
+- NOAA CPC daily population-weighted heating degree days for each year from 1997 to 2024 (`data/hdd/`)
+- The EIA state consumption workbooks for TX and VT (`NG_CONS_SUM_DCU_STX_M.xls`, `NG_CONS_SUM_DCU_SVT_M.xls`)
+
+Common options:
+
+```bash
+python gurobi.py --futures 3.10 3.55 3.90 3.70     # Oct 1 2026 CME settlements, Nov Dec Jan Feb ($/MMBtu)
+python gurobi.py --states VT --theta 3 --cmax-factor 0.97
+python gurobi.py --lower 0.2 0.2 0.2 0.2 --upper 0.8 0.8 0.8 0.8   # policy hedge band
+python gurobi.py --no-cmax                          # drop the high-price cost constraint
+python gurobi.py --company "TX=CENTERPOINT ENERGY ENTEX"
+python gurobi.py --hdd-csv my_hdd.csv --no-download # offline: columns state,date,hdd
+python gurobi.py --help
+```
+
+> **Important: the futures strip.** EIA's NYMEX series ends on April 5, 2024, so the decision-date prices F_m for October 1, 2026 aren't in the data. Pass them with `--futures`. If you leave it out, the script uses the latest October strip in the file (Oct 2, 2023) and prints a warning.
+
+---
+
+## Model
+
+### Sets
+| Set | Description |
+|---|---|
+| M = {Nov, Dec, Jan, Feb} | delivery months, indexed by *m* |
+| S = {1997-98, …, 2023-24} | 27 historical winters (scenarios), indexed by *s* |
+| H ⊂ S | high-price winters (top quartile, which is 7 winters) |
+| R = {TX, VT} | service territories; the model is solved separately for each |
+
+### Parameters
+| Symbol | Meaning | Units | Source / construction |
+|---|---|---|---|
+| F_m | NYMEX futures for month *m* on the decision date | $/MMBtu | CME (`--futures`) |
+| F_sm | NYMEX futures for month *m* on the first trading day of October of winter *s* | $/MMBtu | EIA `NG_PRI_FUT_S1_D` (contracts 1–4 = Nov–Feb) |
+| P_sm | monthly average of daily Henry Hub spot prices | $/MMBtu | EIA `RNGWHHDd` |
+| P̃_sm | F_m · P_sm / F_sm, which applies each past winter's spot "surprise" to today's strip | $/MMBtu | derived |
+| HDD_sm | sum of daily population-weighted HDD in month *m* of winter *s* | °F-days | NOAA CPC `StatesCONUS.Heating.txt` |
+| D_m | forecast utility demand at normal HDD (the 27-winter mean) | MMBtu | regression |
+| D_sm | utility demand at winter *s*'s actual HDD | MMBtu | regression |
+| π_s | scenario probability: 1/27, or H × θ then renormalized when g = 1 | – | assumption + GPR |
+| g | 1 if the Sept 2026 GPR is at or above the 90th percentile of monthly GPR since 1985 | binary | Caldara & Iacoviello GPR |
+| θ | weight multiplier on H when g = 1 (default 2) | – | assumption |
+| L_m, U_m | policy bounds on the hedge share (default 0 and 1) | – | assumption |
+| C_max | cap on the probability-weighted average cost over H | $ | policy (default = H-average cost of a 50% hedge) |
+
+**Demand.** For each month, an OLS fit `StateDemand_sm = a_m + b_m · HDD_sm` is estimated on state residential + commercial consumption. EIA reports it in MMcf, which the script converts at 1,036 MMBtu/MMcf. The fit is then scaled to one utility by its share of state R+C deliveries in EIA-176, averaged over 2020–2024. The default utilities are **Atmos Energy** (TX) and **Vermont Gas Systems** (VT; it is effectively the only gas utility in the state). Pairing each winter's weather with that same winter's prices keeps the "cold winter, high price" correlation in the scenarios.
+
+### Decision variables
+- h_m ∈ [L_m, U_m]: the share of forecast demand D_m hedged with futures for month *m*
+- c_s ∈ ℝ: the total Nov–Feb procurement cost in scenario *s*
+
+### Formulation
+
+$$
+\min_{h,c}\ \sum_{s\in S} \pi_s\, c_s
+$$
+
+subject to
+
+$$
+c_s = \sum_{m\in M}\Big[h_m D_m F_m + (D_{sm} - h_m D_m)\,\tilde P_{sm}\Big] \quad \forall s\in S \qquad \text{(scenario cost)}
+$$
+
+$$
+L_m \le h_m \le U_m \quad \forall m\in M \qquad \text{(hedge policy band; } U_m\le 1 \Rightarrow \text{hedged} \le \text{forecast)}
+$$
+
+$$
+\frac{\sum_{s\in H}\pi_s c_s}{\sum_{s\in H}\pi_s} \le C_{max} \qquad \text{(high-price winter cost limit)}
+$$
+
+If a winter turns out mild and D_sm < h_m D_m, the spot term goes negative: the surplus hedged gas is resold at that month's spot price.
+
+### Geopolitical indicator
+The monthly GPR index is in `data/data_gpr_export.xls`. The 90th percentile of monthly values since 1985 is **148.1**, and **September 2026 is 155.9**, so **g = 1** and the high-price winters are weighted ×θ. Use `--force-g 0` to switch this off.
+
+---
+
+## Outputs
+
+Everything is printed to the console and written to `outputs/<STATE>/`:
+
+| File | Contents |
+|---|---|
+| `optimal_hedge.csv` | h_m and hedged volume (MMBtu) |
+| `strategy_comparison.csv` | 0/25/50/75/100% and optimal hedges: expected cost, H-average cost, worst winter, std. dev., $/MMBtu |
+| `sensitivity_expected_cost.csv` / `sensitivity_hedge_shares.csv` | matrix of θ ∈ {1, 1.5, 2, 3, 4} × C_max factor ∈ {0.90 … 1.10, no limit} |
+| `parameters_month.csv`, `parameters_scenario.csv` | every model parameter (F, P, P̃, D, HDD, π, H membership, optimal c_s) |
+| `strategy_frontier.png`, `sensitivity_heatmap.png` | expected cost vs. high-price exposure, and a heatmap of the sensitivity grid |
+
+The console also reports the regression coefficients and R² for each month, along with the **shadow price of C_max**: how many dollars of expected cost each extra dollar of allowed high-price cost saves.
+
+---
+
+## Data
+
+| # | File | Description | Source |
+|---|---|---|---|
+| 1 | `data/RNGWHHDd.xls` | Henry Hub daily spot price, Jan 1997 to Oct 2026 | [EIA](https://www.eia.gov/dnav/ng/hist/rngwhhdd.htm) |
+| 2 | `NG_CONS_SUM_DCU_S{ST}_M.xls` | Monthly consumption by sector for each state (NY is included; TX and VT are downloaded automatically) | [EIA](https://www.eia.gov/dnav/ng/ng_cons_sum_dcu_STX_m.htm) |
+| 3 | `data/eia176_company_deliveries.xlsx` | EIA-176 annual company-level deliveries by state, 1997–2024 (Mcf) | [EIA-176 query](https://www.eia.gov/naturalgas/ngqs/) |
+| 4 | `data/hdd/` (downloaded) | Daily population-weighted HDD by state | [NOAA CPC](https://ftp.cpc.ncep.noaa.gov/htdocs/degree_days/weighted/daily_data/) |
+| 5 | `data/NG_PRI_FUT_S1_D.xls` | NYMEX futures, contracts 1–4, daily, Dec 1993 to Apr 5 2024 | [EIA](https://www.eia.gov/dnav/ng/ng_pri_fut_s1_d.htm) |
+| 6 | `data/data_gpr_export.xls` | Geopolitical Risk Index, monthly | [Caldara & Iacoviello](https://www.matteoiacoviello.com/gpr.htm) |
+
+---
+
+## Modeling assumptions and notes
+
+- **Price taker.** The utility's purchases don't move futures or spot prices.
+- **Static hedge.** All four hedge shares are set on October 1 and never rebalanced.
+- **Henry Hub as the local price.** Basis differentials, transaction costs and margin calls are ignored.
+- **Linear demand in HDD.** The utility serves a fixed share of state R+C demand.
+- **Monthly averaging.** Daily spot prices are averaged into monthly means.
+- **GPR as a proxy.** GPR stands in for gas-market risk and enters only through the binary indicator g.
+- **Definition of H (a deviation from Milestone 3).** H is ranked on the *rescaled* winter spot P̃ by default, i.e. the winters where spot came in furthest above the October futures. The costs c_s are computed with P̃, so ranking H on raw spot (the 2000s, when all prices were high) picks winters that weren't actually expensive *relative to the hedge*. That makes C_max never bind. `--high-basis raw` restores the Milestone 3 definition.
+- **Expect corner solutions.** The objective is linear, so without the C_max constraint the optimum sits at a bound. Historically, Henry Hub settled about 2–11% below the October futures on average (Nov 0.98, Dec 0.93, Jan/Feb 0.89), so pure expected-cost minimization leans toward hedging nothing. The C_max constraint and θ are what produce interior, risk-aware hedges, which is why the sensitivity matrix is the main result.
