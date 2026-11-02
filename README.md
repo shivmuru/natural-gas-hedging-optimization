@@ -19,6 +19,8 @@ On its first run, the script downloads two things and caches them in `data/`:
 - NOAA CPC daily population-weighted heating degree days for each year from 1997 to 2024 (`data/hdd/`)
 - The EIA state consumption workbooks for TX and VT (`NG_CONS_SUM_DCU_STX_M.xls`, `NG_CONS_SUM_DCU_SVT_M.xls`)
 
+**Prefer Jupyter?** Open `gurobi.ipynb` from the repo root, change the *Settings* cell (it holds the same options as the command-line flags below), and choose *Run All*. The notebook walks through each part of the model (prices, weather, demand, GPR, the Gurobi LP, reporting) and shows the result tables and charts inline.
+
 Common options:
 
 ```bash
