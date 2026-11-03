@@ -33,6 +33,8 @@ Run:
     python gurobi.py                      # TX and VT, baseline settings
     python gurobi.py --states VT --theta 3 --cmax-factor 0.97
     python gurobi.py --futures 3.10 3.55 3.90 3.70   # Oct 1 2026 CME settlements
+    python gurobi.py --decision-year 2025 --futures NOV DEC JAN FEB   # backtest winter 2025-26
+    python gurobi.py --decision-year 2022            # backtest 2022-23 (futures from EIA data)
     python gurobi.py --help
 """
 
@@ -89,9 +91,10 @@ NOAA_HDD_URL = (
 @dataclass
 class Config:
     states: list[str] = field(default_factory=lambda: ["TX", "VT"])
+    decision_year: int = 2026              # hedge decided Oct 1 of this year for Nov..Feb
     theta: float = 2.0                     # weight multiplier on H when g = 1
     gpr_percentile: float = 0.90           # GPR threshold percentile
-    gpr_month: str = "2026-09"             # month whose GPR sets g
+    gpr_month: str | None = None           # month whose GPR sets g (default: Sept of decision_year)
     force_g: int | None = None             # override g (0/1)
     high_quantile: float = 0.75            # H = winters with avg spot >= this quantile
     high_basis: str = "rescaled"           # define H on rescaled spot (default) or "raw" spot
@@ -99,8 +102,8 @@ class Config:
     cmax_abs: float | None = None          # absolute Cmax in $ (overrides factor)
     lower: list[float] = field(default_factory=lambda: [0.0] * 4)
     upper: list[float] = field(default_factory=lambda: [1.0] * 4)
-    futures: list[float] | None = None     # F_m for Nov, Dec, Jan, Feb on Oct 1 2026
-    share_years: list[int] = field(default_factory=lambda: list(range(2020, 2025)))
+    futures: list[float] | None = None     # F_m for Nov, Dec, Jan, Feb on Oct 1 of decision_year
+    share_years: list[int] | None = None   # EIA-176 years for the utility share (default: 5 before decision)
     companies: dict[str, str] = field(default_factory=dict)
     scenario_demand: str = "fitted"        # "fitted" (regression) or "actual"
     data_dir: Path = DATA_DIR
@@ -145,14 +148,38 @@ def winter_month_date(y: int, m: str) -> tuple[int, int]:
     return y + off, cal
 
 
+def scenario_winters(cfg: Config) -> list[str]:
+    """Winters usable as scenarios: only those that ended before the decision date."""
+    last = min(LAST_WINTER, cfg.decision_year - 1)
+    return [winter_label(y) for y in range(FIRST_WINTER, last + 1)]
+
+
+def gpr_month(cfg: Config) -> str:
+    return cfg.gpr_month or f"{cfg.decision_year}-09"
+
+
 # ---------------------------------------------------------------------------
 # 1. Prices
 # ---------------------------------------------------------------------------
-def load_spot(cfg: Config) -> pd.DataFrame:
-    """P_sm: monthly average of daily Henry Hub spot prices, indexed by (winter, month)."""
+def monthly_spot(cfg: Config) -> pd.Series:
+    """Monthly average Henry Hub spot price indexed by (year, month)."""
     df = _read_eia_sheet(cfg.data_dir / "RNGWHHDd.xls")
     df = df.rename(columns={"RNGWHHD": "spot"}).dropna(subset=["spot"])
-    monthly = df.groupby([df.Date.dt.year, df.Date.dt.month])["spot"].mean()
+    return df.groupby([df.Date.dt.year, df.Date.dt.month])["spot"].mean()
+
+
+def actual_winter_spot(cfg: Config, y: int) -> pd.Series | None:
+    """Realized monthly spot for winter y (Nov y .. Feb y+1), or None if not complete yet."""
+    monthly = monthly_spot(cfg)
+    vals = [monthly.get(winter_month_date(y, m)) for m in MONTHS]
+    if any(v is None or pd.isna(v) for v in vals):
+        return None
+    return pd.Series(vals, index=MONTHS, dtype=float)
+
+
+def load_spot(cfg: Config) -> pd.DataFrame:
+    """P_sm: monthly average of daily Henry Hub spot prices, indexed by (winter, month)."""
+    monthly = monthly_spot(cfg)
     rows = {}
     for y in range(FIRST_WINTER, LAST_WINTER + 1):
         rows[winter_label(y)] = [monthly.loc[winter_month_date(y, m)] for m in MONTHS]
@@ -206,12 +233,22 @@ def load_hdd(cfg: Config, states: list[str]) -> pd.DataFrame:
         return df[df.state.isin(states)]
     cache = cfg.data_dir / "hdd"
     frames = []
-    for year in range(FIRST_WINTER, LAST_WINTER + 2):
+    years = sorted(set(range(FIRST_WINTER, LAST_WINTER + 2))
+                   | {cfg.decision_year, cfg.decision_year + 1})
+    for year in years:
         f = cache / f"StatesCONUS.Heating.{year}.txt"
         if not f.exists():
             if not cfg.download:
+                if year > LAST_WINTER + 1:
+                    continue  # only needed for the backtest
                 raise FileNotFoundError(f"{f} missing and --no-download set")
-            _download(NOAA_HDD_URL.format(year=year), f)
+            try:
+                _download(NOAA_HDD_URL.format(year=year), f)
+            except Exception as e:
+                if year > LAST_WINTER + 1:  # decision-winter weather may not exist yet
+                    print(f"  (no NOAA HDD file for {year}: {e})")
+                    continue
+                raise
         frames.append(_parse_cpc_file(f.read_text()))
     df = pd.concat(frames, ignore_index=True)
     return df[df.state.isin(states)]
@@ -234,8 +271,8 @@ def monthly_hdd(hdd: pd.DataFrame, st: str) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 # 3. Demand
 # ---------------------------------------------------------------------------
-def load_state_consumption(cfg: Config, st: str) -> pd.DataFrame:
-    """Residential + commercial consumption for (winter, month), in MMBtu."""
+def state_rc_monthly(cfg: Config, st: str) -> pd.Series:
+    """State residential + commercial consumption in MMBtu, indexed by (year, month)."""
     f = cfg.data_dir / f"NG_CONS_SUM_DCU_S{st}_M.xls"
     if not f.exists():
         if not cfg.download:
@@ -244,12 +281,16 @@ def load_state_consumption(cfg: Config, st: str) -> pd.DataFrame:
     df = _read_eia_sheet(f)
     res = next(c for c in df.columns if c.startswith("N3010"))
     com = next(c for c in df.columns if c.startswith("N3020"))
-    df["rc_mmcf"] = df[res] + df[com]
-    tot = df.set_index([df.Date.dt.year, df.Date.dt.month])["rc_mmcf"]
+    df["rc_mmbtu"] = (df[res] + df[com]) * 1_000 * HEAT_CONTENT  # MMcf -> Mcf -> MMBtu
+    return df.set_index([df.Date.dt.year, df.Date.dt.month])["rc_mmbtu"]
+
+
+def load_state_consumption(cfg: Config, st: str) -> pd.DataFrame:
+    """Residential + commercial consumption for (winter, month), in MMBtu."""
+    tot = state_rc_monthly(cfg, st)
     rows = {}
     for y in range(FIRST_WINTER, LAST_WINTER + 1):
-        rows[winter_label(y)] = [tot.loc[winter_month_date(y, m)] * 1_000 * HEAT_CONTENT
-                                 for m in MONTHS]  # MMcf -> Mcf -> MMBtu
+        rows[winter_label(y)] = [tot.loc[winter_month_date(y, m)] for m in MONTHS]
     return pd.DataFrame.from_dict(rows, orient="index", columns=MONTHS)
 
 
@@ -260,7 +301,10 @@ def utility_share(cfg: Config, st: str) -> tuple[str, float]:
     df["Company"] = df["Company"].astype(str).str.strip()
     company = cfg.companies.get(st, DEFAULT_COMPANY.get(st))
     sub = df[(df.Area == STATE_NAMES[st]) & df.Item.isin(["Residential Volume", "Commercial Volume"])]
-    years = [y for y in cfg.share_years if y in sub.columns]
+    wanted = cfg.share_years or list(range(cfg.decision_year - 5, cfg.decision_year))
+    years = [y for y in wanted if y in sub.columns]
+    if not years:  # decision year beyond the EIA-176 data: use the latest 5 years available
+        years = sorted(c for c in sub.columns if isinstance(c, int))[-5:]
     by_co = sub.groupby("Company")[years].sum(min_count=1)
     total = by_co.loc["Total of All Companies"]
     if company not in by_co.index:
@@ -299,9 +343,9 @@ def geopolitical_indicator(cfg: Config) -> tuple[int, float, float]:
     g = g.dropna(subset=["GPR"])
     hist = g[g.month >= "1985-01-01"]["GPR"]
     thresh = float(hist.quantile(cfg.gpr_percentile))
-    cur = g[g.month.dt.strftime("%Y-%m") == cfg.gpr_month]["GPR"]
+    cur = g[g.month.dt.strftime("%Y-%m") == gpr_month(cfg)]["GPR"]
     if cur.empty:
-        raise ValueError(f"No GPR value for {cfg.gpr_month}")
+        raise ValueError(f"No GPR value for {gpr_month(cfg)}")
     value = float(cur.iloc[0])
     flag = int(value >= thresh) if cfg.force_g is None else int(cfg.force_g)
     return flag, value, thresh
@@ -332,8 +376,10 @@ class Instance:
 
 def build_instance(cfg: Config, st: str, spot, fut_hist, F_now, hdd_daily, gpr) -> Instance:
     company, share = utility_share(cfg, st)
-    state_d = load_state_consumption(cfg, st)
-    HDD = monthly_hdd(hdd_daily, st)
+    S = scenario_winters(cfg)  # no look-ahead: only winters that ended before the decision
+    spot, fut_hist = spot.loc[S], fut_hist.loc[S]
+    state_d = load_state_consumption(cfg, st).loc[S]
+    HDD = monthly_hdd(hdd_daily, st).loc[S]
     fit = fit_demand(state_d, HDD)
 
     D = share * (fit.a + fit.b * fit.hdd_normal)
@@ -533,18 +579,25 @@ def make_plots(out: Path, inst: Instance, strat: pd.DataFrame, sens: dict | None
         fig.tight_layout(); fig.savefig(out / "sensitivity_heatmap.png", dpi=150); plt.close(fig)
 
 
+def out_path(cfg: Config, st: str) -> Path:
+    return cfg.out_dir / f"{st}_{cfg.decision_year}"
+
+
 def report(cfg: Config, inst: Instance, sol: Solution) -> None:
-    out = cfg.out_dir / inst.state
+    out = out_path(cfg, inst.state)
     out.mkdir(parents=True, exist_ok=True)
 
-    print(f"\n{'=' * 72}\n{STATE_NAMES[inst.state]} ({inst.state})\n{'=' * 72}")
+    print(f"\n{'=' * 72}\n{STATE_NAMES[inst.state]} ({inst.state}): hedge decided Oct 1 "
+          f"{cfg.decision_year} for winter {winter_label(cfg.decision_year)}\n{'=' * 72}")
+    S = inst.pi.index
+    print(f"Scenarios: {len(S)} winters, {S[0]} to {S[-1]}")
     print(f"Utility: {inst.company}  (share of state R+C deliveries = {inst.share:.1%})")
     print("Demand regression  D_state = a_m + b_m * HDD_m")
     print(pd.DataFrame({"a_m (MMBtu)": inst.fit.a, "b_m (MMBtu/HDD)": inst.fit.b,
                         "R^2": inst.fit.r2, "normal HDD": inst.fit.hdd_normal}).round(3).to_string())
     print(f"\nForecast utility demand D_m (MMBtu):\n{inst.D.round(0).to_string()}")
     print(f"\nHigh-price winters H ({len(inst.H)}): {', '.join(inst.H)}")
-    print(f"GPR {cfg.gpr_month} = {inst.gpr_value:.1f}, threshold = {inst.gpr_thresh:.1f} "
+    print(f"GPR {gpr_month(cfg)} = {inst.gpr_value:.1f}, threshold = {inst.gpr_thresh:.1f} "
           f"-> g = {inst.g}" + (f", H weights x{cfg.theta}" if inst.g else ""))
     if sol.status != "optimal":
         print(f"\nModel status: {sol.status.upper()} (Cmax = {sol.cmax:,.0f}). "
@@ -585,11 +638,129 @@ def report(cfg: Config, inst: Instance, sol: Solution) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 8. Main
+# 8. Backtest: score the hedge against the winter that actually happened
+# ---------------------------------------------------------------------------
+@dataclass
+class Backtest:
+    months: pd.DataFrame       # month-by-month prices, demand and hedge gains
+    strategies: pd.DataFrame   # realized winter cost of each strategy
+    demand_source: str
+
+
+def actual_winter_demand(cfg: Config, inst: Instance, hdd_daily: pd.DataFrame) -> tuple[pd.Series, str]:
+    """Realized utility demand for the decision winter: actual EIA consumption x share if
+    published, else the regression at actual HDD, else the normal-weather forecast."""
+    y = cfg.decision_year
+    try:
+        tot = state_rc_monthly(cfg, inst.state)
+        vals = [tot.get(winter_month_date(y, m)) for m in MONTHS]
+        if all(v is not None and not pd.isna(v) for v in vals):
+            return inst.share * pd.Series(vals, index=MONTHS, dtype=float), "actual EIA consumption"
+    except Exception:
+        pass
+    d = hdd_daily[hdd_daily.state == inst.state]
+    tot = d.groupby([d.date.dt.year, d.date.dt.month])["hdd"].sum(min_count=1)
+    hdd = [tot.get(winter_month_date(y, m)) for m in MONTHS]
+    if all(v is not None and not pd.isna(v) for v in hdd):
+        hdd = pd.Series(hdd, index=MONTHS, dtype=float)
+        return inst.share * (inst.fit.a + inst.fit.b * hdd), "regression at actual HDD"
+    return inst.D.copy(), "normal-weather forecast (actual weather not available)"
+
+
+def backtest(cfg: Config, inst: Instance, sol: Solution, hdd_daily: pd.DataFrame) -> Backtest | None:
+    P_act = actual_winter_spot(cfg, cfg.decision_year)
+    if P_act is None or sol.h is None:
+        return None
+    D_act, source = actual_winter_demand(cfg, inst, hdd_daily)
+
+    def realized(h: pd.Series) -> float:
+        return float((h * inst.D * inst.F + (D_act - h * inst.D) * P_act).sum())
+
+    lower = pd.Series(cfg.lower, index=MONTHS)
+    upper = pd.Series(cfg.upper, index=MONTHS)
+    strategies = {f"{int(k * 100)}% hedge": pd.Series(k, index=MONTHS) for k in (0, .25, .5, .75, 1)}
+    strategies["Model (optimal)"] = sol.h
+    strategies["Perfect hindsight"] = upper.where(inst.F < P_act, lower)
+    base = realized(strategies["0% hedge"])
+    total = D_act.sum()
+    rows = []
+    for name, h in strategies.items():
+        cost = realized(h)
+        rows.append({"strategy": name, **{f"h_{m}": round(float(h[m]), 4) for m in MONTHS},
+                     "realized_cost": cost, "$per_MMBtu": cost / total,
+                     "savings_vs_no_hedge": base - cost})
+    months = pd.DataFrame({
+        "futures_F_m": inst.F, "actual_spot": P_act, "spot_minus_futures": P_act - inst.F,
+        "forecast_D_m": inst.D, "actual_demand": D_act, "model_h_m": sol.h,
+        "hedged_MMBtu": sol.h * inst.D,
+        "hedge_gain_$": sol.h * inst.D * (P_act - inst.F),  # >0 means the hedge paid off
+    })
+    return Backtest(months, pd.DataFrame(rows).set_index("strategy"), source)
+
+
+def report_backtest(cfg: Config, inst: Instance, bt: Backtest) -> None:
+    out = out_path(cfg, inst.state)
+    print(f"\n--- Backtest: what actually happened in winter {winter_label(cfg.decision_year)} "
+          f"({inst.state}) ---")
+    print(f"Demand used: {bt.demand_source}")
+    print(bt.months.to_string(float_format=lambda v: f"{v:,.3f}" if abs(v) < 100 else f"{v:,.0f}"))
+    print()
+    print(bt.strategies.drop(columns=[f"h_{m}" for m in MONTHS]).to_string(
+        float_format=lambda v: f"{v:,.2f}" if abs(v) < 100 else f"{v:,.0f}"))
+    gain = bt.strategies.loc["Model (optimal)", "savings_vs_no_hedge"]
+    verdict = "SAVED" if gain > 0 else "COST"
+    print(f"\nThe model's hedge {verdict} ${abs(gain):,.0f} versus buying everything at spot.")
+    bt.months.to_csv(out / "backtest_months.csv")
+    bt.strategies.to_csv(out / "backtest_strategies.csv")
+    if cfg.plots:
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+            t = bt.strategies["realized_cost"] / 1e6
+            fig, ax = plt.subplots(figsize=(8, 4))
+            colors = ["#2a6fdb" if n == "Model (optimal)" else "#9aa5b1" for n in t.index]
+            ax.barh(t.index, t.values, color=colors)
+            for i, v in enumerate(t.values):
+                ax.text(v, i, f" {v:,.1f}", va="center", fontsize=9)
+            ax.set_xlim(t.min() * 0.95, t.max() * 1.05)
+            ax.invert_yaxis()
+            ax.set_xlabel("Realized winter cost ($M)")
+            ax.set_title(f"{inst.state}: realized cost, winter {winter_label(cfg.decision_year)}")
+            fig.tight_layout(); fig.savefig(out / "backtest_costs.png", dpi=150); plt.close(fig)
+        except ImportError:
+            pass
+
+
+def resolve_futures(cfg: Config, fut_hist: pd.DataFrame) -> pd.Series:
+    """F_m on the decision date: user input, else the EIA strip for that October if the
+    data covers it, else (forecast mode only) the latest October strip with a warning."""
+    if cfg.futures is not None:
+        return pd.Series(cfg.futures, index=MONTHS, dtype=float)
+    lbl = winter_label(cfg.decision_year)
+    if lbl in fut_hist.index:
+        print(f"  F_m from EIA NYMEX quotes on {fut_hist.attrs['quote_dates'][lbl]}")
+        return fut_hist.loc[lbl].copy()
+    if actual_winter_spot(cfg, cfg.decision_year) is not None:
+        raise ValueError(
+            f"Backtesting winter {lbl} needs the NYMEX settlements from Oct 1 {cfg.decision_year} "
+            f"(not in the EIA file, which ends Apr 2024). Pass them with --futures NOV DEC JAN FEB "
+            f"(or cfg.futures in the notebook).")
+    last = fut_hist.index[-1]
+    print(f"  NOTE: futures not given; using the latest October strip in the EIA file "
+          f"({fut_hist.attrs['quote_dates'][last]}). Pass the Oct 1 {cfg.decision_year} CME "
+          f"settlements with --futures NOV DEC JAN FEB.")
+    return fut_hist.loc[last].copy()
+
+# ---------------------------------------------------------------------------
+# 9. Main
 # ---------------------------------------------------------------------------
 def parse_args(argv=None) -> Config:
     p = argparse.ArgumentParser(description="Natural gas winter hedging LP (Gurobi)")
     p.add_argument("--states", nargs="+", default=["TX", "VT"], choices=list(STATE_NAMES))
+    p.add_argument("--decision-year", type=int, default=2026,
+                   help="hedge decided Oct 1 of this year; a past year also runs a backtest "
+                        "against that winter's actual spot prices")
     p.add_argument("--theta", type=float, default=2.0, help="weight on H winters when g=1")
     p.add_argument("--cmax-factor", type=float, default=1.0,
                    help="Cmax as a multiple of the 50%%-hedge high-price avg cost")
@@ -598,8 +769,8 @@ def parse_args(argv=None) -> Config:
     p.add_argument("--lower", type=float, nargs=4, default=[0, 0, 0, 0], metavar=("NOV", "DEC", "JAN", "FEB"))
     p.add_argument("--upper", type=float, nargs=4, default=[1, 1, 1, 1], metavar=("NOV", "DEC", "JAN", "FEB"))
     p.add_argument("--futures", type=float, nargs=4, default=None, metavar=("NOV", "DEC", "JAN", "FEB"),
-                   help="NYMEX settlements on Oct 1 2026 ($/MMBtu); default = latest October strip in data")
-    p.add_argument("--gpr-month", default="2026-09")
+                   help="NYMEX settlements on Oct 1 of the decision year ($/MMBtu)")
+    p.add_argument("--gpr-month", default=None, help="default: September of the decision year")
     p.add_argument("--force-g", type=int, choices=[0, 1], default=None)
     p.add_argument("--high-basis", choices=["raw", "rescaled"], default="rescaled",
                    help="rank winters for H by rescaled spot Ptilde (default) or raw spot")
@@ -616,7 +787,7 @@ def parse_args(argv=None) -> Config:
     p.add_argument("-v", "--verbose", action="store_true", help="show Gurobi log")
     a = p.parse_args(argv)
     return Config(
-        states=a.states, theta=a.theta, cmax_factor=None if a.no_cmax else a.cmax_factor,
+        states=a.states, decision_year=a.decision_year, theta=a.theta, cmax_factor=None if a.no_cmax else a.cmax_factor,
         cmax_abs=None if a.no_cmax else a.cmax, lower=a.lower, upper=a.upper, futures=a.futures,
         gpr_month=a.gpr_month, force_g=a.force_g, high_basis=a.high_basis,
         scenario_demand=a.scenario_demand,
@@ -633,14 +804,11 @@ def main(argv=None) -> None:
 
     print("Loading prices ...")
     spot = load_spot(cfg)
-    fut_hist, latest = load_futures(cfg)
-    if cfg.futures is not None:
-        F_now = pd.Series(cfg.futures, index=MONTHS)
-    else:
-        F_now = latest.copy()
-        print(f"  NOTE: --futures not given; using the latest October strip in the EIA file "
-              f"({fut_hist.attrs['quote_dates'][fut_hist.index[-1]]}). Pass the Oct 1 2026 CME "
-              f"settlements with --futures NOV DEC JAN FEB.")
+    fut_hist, _ = load_futures(cfg)
+    try:
+        F_now = resolve_futures(cfg, fut_hist)
+    except ValueError as e:
+        sys.exit(str(e))
     print(f"  F_m = {F_now.round(3).to_dict()}")
 
     print("Loading weather ...")
@@ -651,6 +819,9 @@ def main(argv=None) -> None:
         inst = build_instance(cfg, st, spot, fut_hist, F_now, hdd, gpr)
         sol = solve(cfg, inst, resolve_cmax(cfg, inst))
         report(cfg, inst, sol)
+        bt = backtest(cfg, inst, sol, hdd)
+        if bt is not None:
+            report_backtest(cfg, inst, bt)
 
 
 if __name__ == "__main__":
