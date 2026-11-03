@@ -25,6 +25,8 @@ Common options:
 
 ```bash
 python gurobi.py --futures 3.10 3.55 3.90 3.70     # Oct 1 2026 CME settlements, Nov Dec Jan Feb ($/MMBtu)
+python gurobi.py --decision-year 2025 --futures NOV DEC JAN FEB   # backtest winter 2025-26 (Oct 1 2025 settlements)
+python gurobi.py --decision-year 2022               # backtest winter 2022-23 (futures taken from the EIA data)
 python gurobi.py --states VT --theta 3 --cmax-factor 0.97
 python gurobi.py --lower 0.2 0.2 0.2 0.2 --upper 0.8 0.8 0.8 0.8   # policy hedge band
 python gurobi.py --no-cmax                          # drop the high-price cost constraint
@@ -34,6 +36,24 @@ python gurobi.py --help
 ```
 
 > **Important: the futures strip.** EIA's NYMEX series ends on April 5, 2024, so the decision-date prices F_m for October 1, 2026 aren't in the data. Pass them with `--futures`. If you leave it out, the script uses the latest October strip in the file (Oct 2, 2023) and prints a warning.
+
+---
+
+## Backtesting a past winter
+
+`--decision-year` (or `decision_year` in the notebook) sets the October 1 on which the hedge is decided. When that winter is already over, the model is solved using **only the information available at the time**, and the resulting hedge is then scored against what actually happened.
+
+- **No look-ahead.** The scenarios, the demand regression and the high-price set H use only winters that ended before the decision. For a 2022 decision, that means 1997-98 through 2021-22. The GPR indicator uses September of the decision year, and the utility's share uses the 5 years of EIA-176 data before it.
+- **Realized cost.** Each strategy is costed as Σ_m [h_m D_m F_m + (D_actual,m − h_m D_m) · P_actual,m]:
+  - P_actual is the winter's actual monthly Henry Hub average.
+  - D_actual is the utility's share of actual EIA residential + commercial consumption. If EIA hasn't published it yet, the regression at actual HDD is used instead.
+- **Benchmarks.** The model's hedge is compared with fixed 0/25/50/75/100% hedges and a *perfect-hindsight* hedge (U_m in months where spot ended above futures, L_m otherwise).
+- **Outputs.**
+  - `backtest_months.csv`: futures, actual spot, forecast vs. actual demand, and the dollar gain or loss from each month's hedge.
+  - `backtest_strategies.csv`: realized cost and savings vs. no hedge for each strategy.
+  - `backtest_costs.png`: a chart of the strategies' realized costs.
+
+**Winter 2025-26.** The actual Henry Hub monthly averages in the data are Nov $3.79, Dec $4.26, Jan $7.72 and Feb $3.62. The NYMEX settlements from October 1, 2025 are not in the EIA file, so a 2025 backtest needs them passed with `--futures`. For decision years 1998 to 2023, the futures come from the data automatically.
 
 ---
 
@@ -98,7 +118,7 @@ The monthly GPR index is in `data/data_gpr_export.xls`. The 90th percentile of m
 
 ## Outputs
 
-Everything is printed to the console and written to `outputs/<STATE>/`:
+Everything is printed to the console and written to `outputs/<STATE>_<decision year>/` (e.g. `outputs/TX_2026/`):
 
 | File | Contents |
 |---|---|
@@ -107,6 +127,7 @@ Everything is printed to the console and written to `outputs/<STATE>/`:
 | `sensitivity_expected_cost.csv` / `sensitivity_hedge_shares.csv` | matrix of θ ∈ {1, 1.5, 2, 3, 4} × C_max factor ∈ {0.90 … 1.10, no limit} |
 | `parameters_month.csv`, `parameters_scenario.csv` | every model parameter (F, P, P̃, D, HDD, π, H membership, optimal c_s) |
 | `strategy_frontier.png`, `sensitivity_heatmap.png` | expected cost vs. high-price exposure, and a heatmap of the sensitivity grid |
+| `backtest_*.csv`, `backtest_costs.png` | only for past winters: realized cost of each strategy (see *Backtesting a past winter*) |
 
 The console also reports the regression coefficients and R² for each month, along with the **shadow price of C_max**: how many dollars of expected cost each extra dollar of allowed high-price cost saves.
 
