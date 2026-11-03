@@ -151,7 +151,7 @@ The console also reports the regression coefficients and R² for each month, alo
 | # | File | Description | Source |
 |---|---|---|---|
 | 1 | `data/RNGWHHDd.xls` | Henry Hub daily spot price, Jan 1997 to Oct 2026 | [EIA](https://www.eia.gov/dnav/ng/hist/rngwhhdd.htm) |
-| 2 | `NG_CONS_SUM_DCU_S{ST}_M.xls` | Monthly consumption by sector for each state (NY is included; TX and VT are downloaded automatically) | [EIA](https://www.eia.gov/dnav/ng/ng_cons_sum_dcu_STX_m.htm) |
+| 2 | `NG_CONS_SUM_DCU_STX_M.xls`, `NG_CONS_SUM_DCU_SVT_M.xls` (downloaded on first run) | Monthly residential and commercial gas consumption for Texas and Vermont, used for the demand regression. The repo also contains the New York file (`…SNY_M.xls`), which is used only if you run with `--states NY`. | EIA: [Texas](https://www.eia.gov/dnav/ng/ng_cons_sum_dcu_STX_m.htm), [Vermont](https://www.eia.gov/dnav/ng/ng_cons_sum_dcu_SVT_m.htm) |
 | 3 | `data/eia176_company_deliveries.xlsx` | EIA-176 annual company-level deliveries by state, 1997–2024 (Mcf) | [EIA-176 query](https://www.eia.gov/naturalgas/ngqs/) |
 | 4 | `data/hdd/` (downloaded) | Daily population-weighted HDD by state | [NOAA CPC](https://ftp.cpc.ncep.noaa.gov/htdocs/degree_days/weighted/daily_data/) |
 | 5 | `data/NG_PRI_FUT_S1_D.xls` | NYMEX futures, contracts 1–4, daily, Dec 1993 to Apr 5 2024 | [EIA](https://www.eia.gov/dnav/ng/ng_pri_fut_s1_d.htm) |
