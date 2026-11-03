@@ -12,7 +12,7 @@ On October 1, a U.S. gas utility has to decide **what share of each winter month
 
 ```bash
 pip install -r requirements.txt          # gurobipy ships with a free size-limited license, enough for this model
-python gurobi.py                         # Texas and Vermont, baseline settings
+python gurobi.py                         # Texas and Vermont: decide on Oct 2 2023, backtest against actual winter 2023-24
 ```
 
 On its first run, the script downloads two things and caches them in `data/`:

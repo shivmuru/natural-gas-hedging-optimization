@@ -30,7 +30,8 @@ Parameters (all built from the files in ./data and NOAA CPC degree days)
     Cmax       limit on probability-weighted average cost over the high-price winters H
 
 Run:
-    python gurobi.py                      # TX and VT, baseline settings
+    python gurobi.py                      # TX and VT: decide Oct 2 2023, backtest vs. actual winter 2023-24
+    python gurobi.py --decision-year 2026 --futures NOV DEC JAN FEB   # forecast winter 2026-27
     python gurobi.py --states VT --theta 3 --cmax-factor 0.97
     python gurobi.py --futures 3.10 3.55 3.90 3.70   # Oct 1 2026 CME settlements
     python gurobi.py --decision-year 2025 --futures NOV DEC JAN FEB   # backtest winter 2025-26
@@ -91,7 +92,7 @@ NOAA_HDD_URL = (
 @dataclass
 class Config:
     states: list[str] = field(default_factory=lambda: ["TX", "VT"])
-    decision_year: int = 2026              # hedge decided Oct 1 of this year for Nov..Feb
+    decision_year: int = 2023              # hedge decided Oct 1 of this year (2023 = backtest winter 2023-24)
     theta: float = 2.0                     # weight multiplier on H when g = 1
     gpr_percentile: float = 0.90           # GPR threshold percentile
     gpr_month: str | None = None           # month whose GPR sets g (default: Sept of decision_year)
@@ -758,7 +759,7 @@ def resolve_futures(cfg: Config, fut_hist: pd.DataFrame) -> pd.Series:
 def parse_args(argv=None) -> Config:
     p = argparse.ArgumentParser(description="Natural gas winter hedging LP (Gurobi)")
     p.add_argument("--states", nargs="+", default=["TX", "VT"], choices=list(STATE_NAMES))
-    p.add_argument("--decision-year", type=int, default=2026,
+    p.add_argument("--decision-year", type=int, default=2023,
                    help="hedge decided Oct 1 of this year; a past year also runs a backtest "
                         "against that winter's actual spot prices")
     p.add_argument("--theta", type=float, default=2.0, help="weight on H winters when g=1")
