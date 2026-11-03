@@ -78,41 +78,54 @@ python gurobi.py --help
 | D_m | forecast utility demand at normal HDD (the 27-winter mean) | MMBtu | regression |
 | D_sm | utility demand at winter *s*'s actual HDD | MMBtu | regression |
 | π_s | scenario probability: 1/27, or H × θ then renormalized when g = 1 | – | assumption + GPR |
-| g | 1 if the Sept 2026 GPR is at or above the 90th percentile of monthly GPR since 1985 | binary | Caldara & Iacoviello GPR |
+| g | 1 if the GPR for September of the decision year is at or above the 90th percentile of monthly GPR since 1985 | binary | Caldara & Iacoviello GPR |
 | θ | weight multiplier on H when g = 1 (default 2) | – | assumption |
 | L_m, U_m | policy bounds on the hedge share (default 0 and 1) | – | assumption |
 | C_max | cap on the probability-weighted average cost over H | $ | policy (default = H-average cost of a 50% hedge) |
+| c_s(h) | total Nov–Feb procurement cost in scenario *s* for hedge h (defined below) | $ | cost expression, computed from the parameters above and h |
+
+**Scenario cost c_s(h).** For each winter s ∈ S, the cost of hedge h is
+
+$$
+c_s(h) = \sum_{m\in M}\Big[h_m D_m F_m + (D_{sm} - h_m D_m)\,\tilde P_{sm}\Big]
+$$
+
+This is the hedged volume bought at the futures price plus the rest of that winter's demand bought at the rescaled spot price. If a winter turns out mild and D_sm < h_m D_m, the spot term goes negative: the surplus hedged gas is resold at that month's spot price.
+
+c_s is **not a decision variable**. It is fully determined by the hedge shares h_m, so it is written as a cost expression rather than with its own equality constraint. It is listed with the parameters because everything in it except h_m is fixed data. Unlike a true parameter, though, its value changes with h, so it is written c_s(h). For a fixed h, c_s is linear in h, and so the model is a linear program.
 
 **Demand.** For each month, an OLS fit `StateDemand_sm = a_m + b_m · HDD_sm` is estimated on state residential + commercial consumption. EIA reports it in MMcf, which the script converts at 1,036 MMBtu/MMcf. The fit is then scaled to one utility by its share of state R+C deliveries in EIA-176, averaged over 2020–2024. The default utilities are **Atmos Energy** (TX) and **Vermont Gas Systems** (VT; it is effectively the only gas utility in the state). Pairing each winter's weather with that same winter's prices keeps the "cold winter, high price" correlation in the scenarios.
 
 ### Decision variables
-- h_m ∈ [L_m, U_m]: the share of forecast demand D_m hedged with futures for month *m*
-- c_s ∈ ℝ: the total Nov–Feb procurement cost in scenario *s*
+- h_m ∈ [L_m, U_m], m ∈ M: the share of forecast demand D_m hedged with futures for month *m*. These four values are the only decisions.
 
 ### Formulation
 
 $$
-\min_{h,c}\ \sum_{s\in S} \pi_s\, c_s
+\min_{h}\ \sum_{s\in S} \pi_s\, c_s(h)
 $$
 
 subject to
-
-$$
-c_s = \sum_{m\in M}\Big[h_m D_m F_m + (D_{sm} - h_m D_m)\,\tilde P_{sm}\Big] \quad \forall s\in S \qquad \text{(scenario cost)}
-$$
 
 $$
 L_m \le h_m \le U_m \quad \forall m\in M \qquad \text{(hedge policy band; } U_m\le 1 \Rightarrow \text{hedged} \le \text{forecast)}
 $$
 
 $$
-\frac{\sum_{s\in H}\pi_s c_s}{\sum_{s\in H}\pi_s} \le C_{max} \qquad \text{(high-price winter cost limit)}
+\frac{\sum_{s\in H}\pi_s\, c_s(h)}{\sum_{s\in H}\pi_s} \le C_{max} \qquad \text{(high-price winter cost limit)}
 $$
 
-If a winter turns out mild and D_sm < h_m D_m, the spot term goes negative: the surplus hedged gas is resold at that month's spot price.
+*Implementation note:* `gurobi.py` adds c_s to Gurobi as helper variables tied to h by an equality, so that each winter's cost can be read straight off the solution (`c_s_optimal` in `parameters_scenario.csv`). This gives exactly the same optimum as the formulation above, and Gurobi's presolve substitutes them out.
 
 ### Geopolitical indicator
-The monthly GPR index is in `data/data_gpr_export.xls`. The 90th percentile of monthly values since 1985 is **148.1**, and **September 2026 is 155.9**, so **g = 1** and the high-price winters are weighted ×θ. Use `--force-g 0` to switch this off.
+The monthly Geopolitical Risk (GPR) index of Caldara & Iacoviello is in `data/data_gpr_export.xls`. The code uses it in four steps:
+
+1. **Threshold.** It takes every monthly GPR value from January 1985 onward and computes the 90th percentile, which is **148.1**.
+2. **Signal.** It reads the GPR for September of the decision year, the last full month before the October 1 decision. If that value is at or above the threshold, **g = 1**; otherwise g = 0. September 2026 is **155.9** (g = 1). September 2025 is **126.7**, below the threshold (g = 0), so the 2025 backtest uses equal weights.
+3. **Reweighting.** If g = 1, each high-price winter in H has its weight multiplied by θ (default 2), and all weights are renormalized to sum to 1. With 7 of 27 winters in H and θ = 2, the H winters go from 26% of the total probability to 41%. If g = 0, every winter keeps weight 1/|S|.
+4. **Effect on the model.** g only changes the probabilities π_s. It does not change prices, demand or C_max's definition. Because π_s appears in both the objective (expected cost) and the C_max constraint (H-average cost), a higher weight on expensive winters makes hedging look more valuable on average. That is why θ ≥ 3 pushes the model to hedge more even without the cost limit.
+
+The data, parameters and constraints are otherwise the same whether g is 0 or 1. Use `--force-g 0` or `--force-g 1` (or `force_g` in the notebook) to override the rule, and `--theta` to change the multiplier.
 
 ---
 
