@@ -4,29 +4,39 @@ Natural Gas Winter Hedging Optimization (Team 28)
 
 On October 1 a U.S. gas utility decides what share h_m of each winter month's
 forecast demand (Nov, Dec, Jan, Feb) to lock in at NYMEX futures prices. The
-rest is bought at the Henry Hub spot price. The model is a two-stage scenario
-LP solved with Gurobi:
+rest is bought at the Henry Hub spot price. In winter s the cost of hedge h is
 
-    min   sum_s pi_s * c_s
-    s.t.  c_s = sum_m [ h_m D_m F_m + (D_sm - h_m D_m) * Ptilde_sm ]   for all s in S
-          L_m <= h_m <= U_m                                           for all m in M
-          sum_{s in H} pi_s c_s / sum_{s in H} pi_s <= Cmax
+    sum_m [ h_m D_m F_m + (D_sm - h_m D_m) Ptilde_sm ]
+  = sum_m (F_m - Ptilde_sm) D_m h_m  +  sum_m D_sm Ptilde_sm
+
+so, weighting winters by pi_s (all winters) or pi~_s (high-price winters), the
+model is a linear program in the four hedge shares only, solved with Gurobi:
+
+    min   sum_m (F_m - Pbar_m) D_m h_m  +  K                  (K constant: same optimal h)
+    s.t.  L_m <= h_m <= U_m                                   for all m in M
+          sum_m (F_m - PbarH_m) D_m h_m  +  KH  <=  Cmax      (high-price cost limit)
+      i.e. sum_m (PbarH_m - F_m) D_m h_m  >=  KH - Cmax
+
+    pi~_s   = pi_s / sum_{s' in H} pi_s'                    (probability given a high-price winter)
+    Pbar_m  = sum_{s in S} pi_s  Ptilde_sm,   PbarH_m = sum_{s in H} pi~_s Ptilde_sm
+    K       = sum_{s in S} pi_s  sum_m D_sm Ptilde_sm   (expected cost with no hedge)
+    KH      = sum_{s in H} pi~_s sum_m D_sm Ptilde_sm   (high-price cost with no hedge)
 
 Sets
     M = {Nov, Dec, Jan, Feb}          delivery months
-    S = {1997-98, ..., 2023-24}       historical winters (scenarios)
+    S = {1997-98, ..., }              historical winters that ended before the decision
     H ⊂ S                             top-quartile winters by average (rescaled) Henry Hub spot
     R = {TX, VT}                      service territories (one model per state)
 
 Parameters (all built from the files in ./data and NOAA CPC degree days)
-    F_m        futures price for month m on the decision date (Oct 1, 2026)
+    F_m        futures price for month m on the decision date (first trading day of October)
     F_sm       futures price for month m on the first trading day of October of winter s
     P_sm       monthly average Henry Hub spot price in month m of winter s
     Ptilde_sm  = F_m * P_sm / F_sm (historical spot surprise applied to today's strip)
     D_m        forecast utility demand at normal HDD (regression)
     D_sm       utility demand at winter s's actual HDD (regression)
     pi_s       scenario probability; high-price winters get weight * theta if g = 1
-    g          geopolitical indicator: 1 if Sept-2026 GPR >= 90th pct of monthly GPR since 1985
+    g          geopolitical indicator: 1 if September GPR >= 90th pct of monthly GPR since 1985
     Cmax       limit on probability-weighted average cost over the high-price winters H
 
 Run:
@@ -408,16 +418,40 @@ def build_instance(cfg: Config, st: str, spot, fut_hist, F_now, hdd_daily, gpr) 
 # ---------------------------------------------------------------------------
 # 6. Cost evaluation and the Gurobi model
 # ---------------------------------------------------------------------------
+@dataclass
+class Coefficients:
+    """Fixed numbers that the objective and the high-price cost limit are built from."""
+    pi_tilde: pd.Series   # pi~_s: probability of winter s given a high-price winter (sums to 1 over H)
+    Pbar: pd.Series       # Pbar_m:  expected rescaled spot, all winters
+    PbarH: pd.Series      # PbarH_m: expected rescaled spot, high-price winters
+    K: float              # expected cost with no hedge
+    KH: float             # high-price-winter cost with no hedge
+    obj: pd.Series        # (F_m - Pbar_m) D_m:  expected extra cost of fully hedging month m
+    protect: pd.Series    # (PbarH_m - F_m) D_m: high-price saving from fully hedging month m
+
+
+def cost_coefficients(inst: Instance) -> Coefficients:
+    pi_tilde = inst.pi[inst.H] / inst.pi[inst.H].sum()
+    Pbar = inst.Ptilde.mul(inst.pi, axis=0).sum()
+    PbarH = inst.Ptilde.loc[inst.H].mul(pi_tilde, axis=0).sum()
+    spot_cost = (inst.Ds * inst.Ptilde).sum(axis=1)  # no-hedge cost in each winter
+    K = float((inst.pi * spot_cost).sum())
+    KH = float((pi_tilde * spot_cost[inst.H]).sum())
+    return Coefficients(pi_tilde, Pbar, PbarH, K, KH,
+                        (inst.F - Pbar) * inst.D, (PbarH - inst.F) * inst.D)
+
+
 def scenario_costs(inst: Instance, h: pd.Series) -> pd.Series:
-    """c_s for a fixed hedge vector h (used for benchmarks and Cmax calibration)."""
+    """Cost of a fixed hedge h in every winter (for reporting, benchmarks and Cmax calibration)."""
     hedged = (h * inst.D * inst.F).sum()
     spot_part = ((inst.Ds - h * inst.D) * inst.Ptilde).sum(axis=1)
     return hedged + spot_part
 
 
 def high_avg(inst: Instance, c: pd.Series) -> float:
-    w = inst.pi[inst.H]
-    return float((w * c[inst.H]).sum() / w.sum())
+    """High-price-winter expected cost: sum over H of pi~_s * cost_s."""
+    w = inst.pi[inst.H] / inst.pi[inst.H].sum()
+    return float((w * c[inst.H]).sum())
 
 
 def resolve_cmax(cfg: Config, inst: Instance) -> float | None:
@@ -438,7 +472,7 @@ def cmax_from_factor(inst: Instance, factor: float | None) -> float | None:
 class Solution:
     status: str
     h: pd.Series | None = None
-    c: pd.Series | None = None
+    c: pd.Series | None = None          # cost in each winter, computed from h after solving
     expected: float | None = None
     high_avg: float | None = None
     cmax: float | None = None
@@ -446,35 +480,28 @@ class Solution:
 
 
 def solve(cfg: Config, inst: Instance, cmax: float | None) -> Solution:
+    """The LP in collected form: decision variables h_m only."""
+    co = cost_coefficients(inst)
     env = gp.Env(empty=True)
     env.setParam("OutputFlag", 1 if cfg.verbose else 0)
     env.start()
     mdl = gp.Model(f"hedge_{inst.state}", env=env)
 
-    S = list(inst.pi.index)
+    # Decision variables with the hedge-share bounds L_m <= h_m <= U_m (constraint 1)
     h = mdl.addVars(MONTHS, lb={m: cfg.lower[i] for i, m in enumerate(MONTHS)},
                     ub={m: cfg.upper[i] for i, m in enumerate(MONTHS)}, name="h")
-    c = mdl.addVars(S, lb=-GRB.INFINITY, name="c")
 
-    # (1) scenario cost definition
-    for s in S:
-        mdl.addConstr(
-            c[s] == gp.quicksum(
-                h[m] * inst.D[m] * inst.F[m]
-                + (inst.Ds.at[s, m] - h[m] * inst.D[m]) * inst.Ptilde.at[s, m]
-                for m in MONTHS),
-            name=f"cost[{s}]")
+    # Objective: min sum_m (F_m - Pbar_m) D_m h_m + K. K does not change the optimal h;
+    # it is set as the objective constant so ObjVal is the expected cost in dollars.
+    mdl.setObjective(gp.quicksum(co.obj[m] * h[m] for m in MONTHS), GRB.MINIMIZE)
+    mdl.ObjCon = co.K
 
-    # (2) hedge-share bounds are variable bounds (L_m <= h_m <= U_m)
-
-    # (3) high-price scenario cost limit
+    # Constraint 2, high-price cost limit: sum_m (F_m - PbarH_m) D_m h_m + KH <= Cmax,
+    # written as  sum_m (PbarH_m - F_m) D_m h_m >= KH - Cmax  (the hedge must save enough)
     risk = None
     if cmax is not None:
-        wH = float(inst.pi[inst.H].sum())
-        risk = mdl.addConstr(
-            gp.quicksum(inst.pi[s] * c[s] for s in inst.H) <= cmax * wH, name="high_price_limit")
-
-    mdl.setObjective(gp.quicksum(inst.pi[s] * c[s] for s in S), GRB.MINIMIZE)
+        risk = mdl.addConstr(gp.quicksum(co.protect[m] * h[m] for m in MONTHS) >= co.KH - cmax,
+                             name="high_price_limit")
     mdl.optimize()
 
     if mdl.Status != GRB.OPTIMAL:
@@ -484,11 +511,9 @@ def solve(cfg: Config, inst: Instance, cmax: float | None) -> Solution:
         return Solution(status, cmax=cmax)
 
     hv = pd.Series({m: h[m].X for m in MONTHS})
-    cv = pd.Series({s: c[s].X for s in S})
-    dual = None
-    if risk is not None:
-        # $ of expected cost saved per extra $ of allowed high-price average cost
-        dual = -risk.Pi * float(inst.pi[inst.H].sum())
+    cv = scenario_costs(inst, hv)
+    # Shadow price: $ of expected cost saved per extra $ of allowed high-price cost
+    dual = float(risk.Pi) if risk is not None else None
     sol = Solution("optimal", hv, cv, mdl.ObjVal, high_avg(inst, cv), cmax, dual)
     mdl.dispose(); env.dispose()
     return sol
@@ -598,6 +623,13 @@ def report(cfg: Config, inst: Instance, sol: Solution) -> None:
                         "R^2": inst.fit.r2, "normal HDD": inst.fit.hdd_normal}).round(3).to_string())
     print(f"\nForecast utility demand D_m (MMBtu):\n{inst.D.round(0).to_string()}")
     print(f"\nHigh-price winters H ({len(inst.H)}): {', '.join(inst.H)}")
+    co = cost_coefficients(inst)
+    coef = pd.DataFrame({"F_m": inst.F, "Pbar_m": co.Pbar, "PbarH_m": co.PbarH,
+                         "premium F-Pbar": inst.F - co.Pbar, "protection PbarH-F": co.PbarH - inst.F})
+    coef["protection per $ premium"] = coef["protection PbarH-F"] / coef["premium F-Pbar"]
+    print("Cost coefficients ($/MMBtu):")
+    print(coef.round(3).to_string())
+    print(f"K (expected no-hedge cost) = ${co.K:,.0f};  KH (high-price no-hedge cost) = ${co.KH:,.0f}")
     print(f"GPR {gpr_month(cfg)} = {inst.gpr_value:.1f}, threshold = {inst.gpr_thresh:.1f} "
           f"-> g = {inst.g}" + (f", H weights x{cfg.theta}" if inst.g else ""))
     if sol.status != "optimal":
@@ -617,11 +649,14 @@ def report(cfg: Config, inst: Instance, sol: Solution) -> None:
         float_format=lambda v: f"{v:,.2f}" if abs(v) < 100 else f"{v:,.0f}"))
 
     # save parameters and results
-    pd.DataFrame({"F_m": inst.F, "D_m": inst.D, "L_m": cfg.lower, "U_m": cfg.upper}).to_csv(
+    pd.DataFrame({"F_m": inst.F, "D_m": inst.D, "L_m": cfg.lower, "U_m": cfg.upper,
+                  "Pbar_m": co.Pbar, "PbarH_m": co.PbarH, "obj_coef": co.obj,
+                  "protect_coef": co.protect}).assign(K=co.K, KH=co.KH).to_csv(
         out / "parameters_month.csv")
     pd.concat({"F_sm": inst.F_hist, "P_sm": inst.P, "Ptilde_sm": inst.Ptilde,
                "D_sm": inst.Ds, "HDD_sm": inst.HDD}, axis=1).assign(
-        pi_s=inst.pi, in_H=inst.pi.index.isin(inst.H), c_s_optimal=sol.c).to_csv(
+        pi_s=inst.pi, in_H=inst.pi.index.isin(inst.H), pi_tilde_s=co.pi_tilde,
+        cost_s_optimal=sol.c).to_csv(
         out / "parameters_scenario.csv")
     pd.DataFrame({"h_m": sol.h, "hedged_MMBtu": sol.h * inst.D}).to_csv(out / "optimal_hedge.csv")
     strat.to_csv(out / "strategy_comparison.csv")

@@ -115,7 +115,11 @@ $$
 \frac{\sum_{s\in H}\pi_s\, c_s(h)}{\sum_{s\in H}\pi_s} \le C_{max} \qquad \text{(high-price winter cost limit)}
 $$
 
-*Implementation note:* `gurobi.py` adds c_s to Gurobi as helper variables tied to h by an equality, so that each winter's cost can be read straight off the solution (`c_s_optimal` in `parameters_scenario.csv`). This gives exactly the same optimum as the formulation above, and Gurobi's presolve substitutes them out.
+*Implementation:* `gurobi.py` builds this model in collected form, with the four h_m as its only variables and one linear constraint:
+
+min Σ_m (F_m − P̄_m) D_m h_m + K  s.t.  L_m ≤ h_m ≤ U_m,  Σ_m (F_m − P̄^H_m) D_m h_m + K^H ≤ C_max
+
+Here π̃_s = π_s / Σ_{s∈H} π_s (probability of winter s given a high-price winter), P̄_m = Σ_{s∈S} π_s P̃_sm and P̄^H_m = Σ_{s∈H} π̃_s P̃_sm are the expected rescaled spot prices, and K, K^H are the expected no-hedge costs over all winters and over H. Expanding c_s(h) and collecting terms in h gives exactly this form. K does not change the optimal hedge; it is set as the objective constant so the reported objective is the expected cost. Each winter's cost is computed from the optimal h after solving (`cost_s_optimal` in `parameters_scenario.csv`).
 
 ### Geopolitical indicator
 The monthly Geopolitical Risk (GPR) index of Caldara & Iacoviello is in `data/data_gpr_export.xls`. The code uses it in four steps:
