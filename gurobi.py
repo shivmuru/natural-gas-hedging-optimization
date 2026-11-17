@@ -13,7 +13,8 @@ so, weighting winters by pi_s (all winters) or pi~_s (high-price winters), the
 model is a linear program in the four hedge shares only, solved with Gurobi:
 
     min   sum_m (F_m - Pbar_m) D_m h_m  +  K                  (K constant: same optimal h)
-    s.t.  L_m <= h_m <= U_m                                   for all m in M
+    s.t.  L_m <= h_m <= U_m                                   for all m in M  (policy bounds, 20%-80%)
+          sum_m F_m D_m h_m  <=  B                            (hedging budget)
           sum_m (F_m - PbarH_m) D_m h_m  +  KH  <=  Cmax      (high-price cost limit)
       i.e. sum_m (PbarH_m - F_m) D_m h_m  >=  KH - Cmax
 
@@ -46,6 +47,7 @@ Run:
     python gurobi.py --futures 3.10 3.55 3.90 3.70   # Oct 1 2026 CME settlements
     python gurobi.py --decision-year 2025 --futures NOV DEC JAN FEB   # backtest winter 2025-26
     python gurobi.py --decision-year 2022            # backtest 2022-23 (futures from EIA data)
+    python gurobi.py --train-test                    # train on first 20 winters, test on the rest
     python gurobi.py --help
 """
 
@@ -55,7 +57,7 @@ import argparse
 import io
 import sys
 import urllib.request
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import numpy as np
@@ -111,8 +113,13 @@ class Config:
     high_basis: str = "rescaled"           # define H on rescaled spot (default) or "raw" spot
     cmax_factor: float | None = 1.0        # Cmax = factor * H-avg cost of the 50% hedge
     cmax_abs: float | None = None          # absolute Cmax in $ (overrides factor)
-    lower: list[float] = field(default_factory=lambda: [0.0] * 4)
-    upper: list[float] = field(default_factory=lambda: [1.0] * 4)
+    lower: list[float] = field(default_factory=lambda: [0.2] * 4)   # L_m: policy minimum hedge
+    upper: list[float] = field(default_factory=lambda: [0.8] * 4)   # U_m: policy maximum hedge
+    budget_share: float | None = 0.5       # B = share x cost of buying all forecast demand at futures
+    budget_abs: float | None = None        # absolute hedging budget B in $ (overrides budget_share)
+    train_test: bool = False               # run the train/test backtest instead of a single decision
+    n_train: int = 20                      # winters in the training set (first n_train winters)
+    train_mode: str = "fixed"              # "fixed" (train once) or "expanding" (retrain each year)
     futures: list[float] | None = None     # F_m for Nov, Dec, Jan, Feb on Oct 1 of decision_year
     share_years: list[int] | None = None   # EIA-176 years for the utility share (default: 5 before decision)
     companies: dict[str, str] = field(default_factory=dict)
@@ -385,9 +392,11 @@ class Instance:
     gpr_thresh: float
 
 
-def build_instance(cfg: Config, st: str, spot, fut_hist, F_now, hdd_daily, gpr) -> Instance:
+def build_instance(cfg: Config, st: str, spot, fut_hist, F_now, hdd_daily, gpr,
+                   S: list[str] | None = None) -> Instance:
     company, share = utility_share(cfg, st)
-    S = scenario_winters(cfg)  # no look-ahead: only winters that ended before the decision
+    if S is None:
+        S = scenario_winters(cfg)  # no look-ahead: only winters that ended before the decision
     spot, fut_hist = spot.loc[S], fut_hist.loc[S]
     state_d = load_state_consumption(cfg, st).loc[S]
     HDD = monthly_hdd(hdd_daily, st).loc[S]
@@ -468,6 +477,17 @@ def cmax_from_factor(inst: Instance, factor: float | None) -> float | None:
     return factor * ref
 
 
+def resolve_budget(cfg: Config, inst: Instance, share: float | None | str = "cfg") -> float | None:
+    """Hedging budget B: the most the utility will commit to futures purchases on Oct 1.
+    Default: budget_share x (cost of buying all forecast demand at futures prices)."""
+    if cfg.budget_abs is not None and share == "cfg":
+        return cfg.budget_abs
+    share = cfg.budget_share if share == "cfg" else share
+    if share is None:
+        return None
+    return float(share * (inst.F * inst.D).sum())
+
+
 @dataclass
 class Solution:
     status: str
@@ -476,10 +496,16 @@ class Solution:
     expected: float | None = None
     high_avg: float | None = None
     cmax: float | None = None
-    cmax_dual: float | None = None
+    cmax_dual: float | None = None      # $ expected cost saved per extra $ of Cmax
+    budget: float | None = None
+    budget_dual: float | None = None    # $ expected cost saved per extra $ of hedging budget
+    spend: float | None = None          # $ committed to futures: sum_m F_m D_m h_m
+    ranging: pd.DataFrame | None = None # post-optimality analysis per variable
+    constraints: pd.DataFrame | None = None  # slack, shadow price and RHS range per constraint
 
 
-def solve(cfg: Config, inst: Instance, cmax: float | None) -> Solution:
+def solve(cfg: Config, inst: Instance, cmax: float | None,
+          budget: float | None | str = "cfg") -> Solution:
     """The LP in collected form: decision variables h_m only."""
     co = cost_coefficients(inst)
     env = gp.Env(empty=True)
@@ -496,7 +522,15 @@ def solve(cfg: Config, inst: Instance, cmax: float | None) -> Solution:
     mdl.setObjective(gp.quicksum(co.obj[m] * h[m] for m in MONTHS), GRB.MINIMIZE)
     mdl.ObjCon = co.K
 
-    # Constraint 2, high-price cost limit: sum_m (F_m - PbarH_m) D_m h_m + KH <= Cmax,
+    # Constraint 2, hedging budget: sum_m F_m D_m h_m <= B
+    if budget == "cfg":
+        budget = resolve_budget(cfg, inst)
+    bud = None
+    if budget is not None:
+        bud = mdl.addConstr(gp.quicksum(inst.F[m] * inst.D[m] * h[m] for m in MONTHS) <= budget,
+                            name="hedging_budget")
+
+    # Constraint 3, high-price cost limit: sum_m (F_m - PbarH_m) D_m h_m + KH <= Cmax,
     # written as  sum_m (PbarH_m - F_m) D_m h_m >= KH - Cmax  (the hedge must save enough)
     risk = None
     if cmax is not None:
@@ -508,13 +542,34 @@ def solve(cfg: Config, inst: Instance, cmax: float | None) -> Solution:
         status = {GRB.INFEASIBLE: "infeasible", GRB.INF_OR_UNBD: "infeasible"}.get(
             mdl.Status, f"status_{mdl.Status}")
         mdl.dispose(); env.dispose()
-        return Solution(status, cmax=cmax)
+        return Solution(status, cmax=cmax, budget=budget)
 
     hv = pd.Series({m: h[m].X for m in MONTHS})
     cv = scenario_costs(inst, hv)
-    # Shadow price: $ of expected cost saved per extra $ of allowed high-price cost
+    # Shadow prices: $ of expected cost saved per extra $ of allowed high-price cost / budget
     dual = float(risk.Pi) if risk is not None else None
-    sol = Solution("optimal", hv, cv, mdl.ObjVal, high_avg(inst, cv), cmax, dual)
+    bdual = float(-bud.Pi) if bud is not None else None
+    spend = float((inst.F * inst.D * hv).sum())
+
+    # Post-optimality analysis (LP ranging): reduced costs, and the range of each objective
+    # coefficient over which the current hedge stays optimal
+    ranging = pd.DataFrame({
+        "h_m": hv,
+        "at_bound": [("lower" if abs(h[m].X - h[m].LB) < 1e-9 else
+                      "upper" if abs(h[m].X - h[m].UB) < 1e-9 else "between") for m in MONTHS],
+        "obj_coef_$": co.obj,
+        "reduced_cost_$": [h[m].RC for m in MONTHS],
+        "obj_coef_low_$": [h[m].SAObjLow for m in MONTHS],
+        "obj_coef_high_$": [h[m].SAObjUp for m in MONTHS],
+    }, index=MONTHS)
+    rows = {}
+    for name, con in (("hedging_budget", bud), ("high_price_limit", risk)):
+        if con is not None:
+            rows[name] = {"slack": con.Slack, "shadow_price": con.Pi,
+                          "rhs": con.RHS, "rhs_low": con.SARHSLow, "rhs_high": con.SARHSUp}
+    constraints = pd.DataFrame.from_dict(rows, orient="index") if rows else None
+    sol = Solution("optimal", hv, cv, mdl.ObjVal, high_avg(inst, cv), cmax, dual,
+                   budget, bdual, spend, ranging, constraints)
     mdl.dispose(); env.dispose()
     return sol
 
@@ -522,8 +577,15 @@ def solve(cfg: Config, inst: Instance, cmax: float | None) -> Solution:
 # ---------------------------------------------------------------------------
 # 7. Reporting, benchmarks and sensitivity
 # ---------------------------------------------------------------------------
+FIXED_LEVELS = (0.0, 0.2, 0.5, 0.8, 1.0)  # 0% and 100% lie outside the 20-80% policy band
+
+
+def fixed_strategies() -> dict[str, pd.Series]:
+    return {f"{int(k * 100)}% hedge": pd.Series(k, index=MONTHS) for k in FIXED_LEVELS}
+
+
 def strategy_table(inst: Instance, sol: Solution) -> pd.DataFrame:
-    strategies = {f"{int(k * 100)}% hedge": pd.Series(k, index=MONTHS) for k in (0, .25, .5, .75, 1)}
+    strategies = fixed_strategies()
     if sol.h is not None:
         strategies["Optimal"] = sol.h
     total_vol = inst.D.sum()
@@ -539,6 +601,7 @@ def strategy_table(inst: Instance, sol: Solution) -> pd.DataFrame:
             "worst_winter": c.idxmax(),
             "std_cost": np.sqrt((inst.pi * (c - (inst.pi * c).sum()) ** 2).sum()),
             "expected_$per_MMBtu": (inst.pi * c).sum() / total_vol,
+            "futures_spend": float((inst.F * inst.D * h).sum()),
         })
     return pd.DataFrame(rows).set_index("strategy")
 
@@ -563,9 +626,23 @@ def sensitivity(cfg: Config, inst: Instance) -> dict[str, pd.DataFrame]:
             h_row[col] = "/".join(f"{v:.2f}" for v in s.h) if s.h is not None else s.status
         exp_tab[f"theta={th}"] = exp_row
         hedge_tab[f"theta={th}"] = h_row
+    # Hedging budget x Cmax grid (at the instance's own probabilities)
+    shares = [0.35, 0.40, 0.45, 0.50, 0.60, None]
+    bexp, bhedge = {}, {}
+    for b in shares:
+        brow, bh = {}, {}
+        for fct in factors:
+            col = "no limit" if fct is None else f"{fct:.2f}x"
+            s = solve(cfg, inst, cmax_from_factor(inst, fct), resolve_budget(cfg, inst, b))
+            brow[col] = s.expected if s.status == "optimal" else np.nan
+            bh[col] = "/".join(f"{v:.2f}" for v in s.h) if s.h is not None else s.status
+        key = "no budget" if b is None else f"budget={b:.0%}"
+        bexp[key], bhedge[key] = brow, bh
     return {
         "sensitivity_expected_cost": pd.DataFrame.from_dict(exp_tab, orient="index"),
         "sensitivity_hedge_shares": pd.DataFrame.from_dict(hedge_tab, orient="index"),
+        "sensitivity_budget_expected_cost": pd.DataFrame.from_dict(bexp, orient="index"),
+        "sensitivity_budget_hedge_shares": pd.DataFrame.from_dict(bhedge, orient="index"),
     }
 
 
@@ -633,15 +710,26 @@ def report(cfg: Config, inst: Instance, sol: Solution) -> None:
     print(f"GPR {gpr_month(cfg)} = {inst.gpr_value:.1f}, threshold = {inst.gpr_thresh:.1f} "
           f"-> g = {inst.g}" + (f", H weights x{cfg.theta}" if inst.g else ""))
     if sol.status != "optimal":
-        print(f"\nModel status: {sol.status.upper()} (Cmax = {sol.cmax:,.0f}). "
-              "Loosen --cmax-factor or the hedge bounds.")
+        print(f"\nModel status: {sol.status.upper()} (Cmax = {sol.cmax or 0:,.0f}, budget = "
+              f"{sol.budget or 0:,.0f}). Loosen --cmax-factor, --budget-share or the hedge bounds.")
         return
     print(f"\nOptimal hedge shares: " + ", ".join(f"{m} {sol.h[m]:.1%}" for m in MONTHS))
     print(f"Expected cost      : ${sol.expected:,.0f}")
     print(f"High-price avg cost: ${sol.high_avg:,.0f}"
           + (f"  (Cmax = ${sol.cmax:,.0f})" if sol.cmax else ""))
+    if sol.budget is not None:
+        print(f"Futures spend      : ${sol.spend:,.0f}  (budget B = ${sol.budget:,.0f}, "
+              f"{'binding' if sol.budget - sol.spend < 1 else 'slack'})")
     if sol.cmax_dual is not None:
-        print(f"Shadow price of Cmax: {sol.cmax_dual:.4f} $ expected / $ of Cmax")
+        print(f"Shadow price of Cmax  : {sol.cmax_dual:.4f} $ expected / $ of Cmax")
+    if sol.budget_dual is not None:
+        print(f"Shadow price of budget: {sol.budget_dual:.4f} $ expected / $ of budget")
+    print("\nPost-optimality analysis (hedge stays optimal while each objective coefficient "
+          "stays in [low, high]):")
+    print(sol.ranging.to_string(float_format=lambda v: f"{v:,.3f}" if abs(v) < 100 else f"{v:,.0f}"))
+    if sol.constraints is not None:
+        print("Constraints (RHS range keeps the same binding set):")
+        print(sol.constraints.to_string(float_format=lambda v: f"{v:,.4f}" if abs(v) < 100 else f"{v:,.0f}"))
 
     strat = strategy_table(inst, sol)
     print("\nStrategy comparison:")
@@ -660,6 +748,9 @@ def report(cfg: Config, inst: Instance, sol: Solution) -> None:
         out / "parameters_scenario.csv")
     pd.DataFrame({"h_m": sol.h, "hedged_MMBtu": sol.h * inst.D}).to_csv(out / "optimal_hedge.csv")
     strat.to_csv(out / "strategy_comparison.csv")
+    sol.ranging.to_csv(out / "post_optimality_variables.csv")
+    if sol.constraints is not None:
+        sol.constraints.to_csv(out / "post_optimality_constraints.csv")
 
     sens = None
     if cfg.sensitivity:
@@ -714,9 +805,9 @@ def backtest(cfg: Config, inst: Instance, sol: Solution, hdd_daily: pd.DataFrame
 
     lower = pd.Series(cfg.lower, index=MONTHS)
     upper = pd.Series(cfg.upper, index=MONTHS)
-    strategies = {f"{int(k * 100)}% hedge": pd.Series(k, index=MONTHS) for k in (0, .25, .5, .75, 1)}
+    strategies = fixed_strategies()
     strategies["Model (optimal)"] = sol.h
-    strategies["Perfect hindsight"] = upper.where(inst.F < P_act, lower)
+    strategies["Perfect hindsight"] = upper.where(inst.F < P_act, lower)  # within the policy band
     base = realized(strategies["0% hedge"])
     total = D_act.sum()
     rows = []
@@ -788,6 +879,78 @@ def resolve_futures(cfg: Config, fut_hist: pd.DataFrame) -> pd.Series:
           f"settlements with --futures NOV DEC JAN FEB.")
     return fut_hist.loc[last].copy()
 
+def train_test(cfg: Config, st: str, spot: pd.DataFrame, fut_hist: pd.DataFrame,
+               hdd_daily: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Out-of-sample backtest. The first n_train winters are the training set; each later winter
+    with complete data is a test winter. For each test winter the model is solved with that
+    October's futures and only training information ("fixed": the first n_train winters;
+    "expanding": every winter before the test winter), then scored against what happened."""
+    winters = list(spot.index)                       # 1997-98 .. 2023-24
+    train, test = winters[:cfg.n_train], winters[cfg.n_train:]
+    rows = []
+    for lbl in test:
+        y = int(lbl[:4])
+        cfg_y = replace(cfg, decision_year=y, futures=None, sensitivity=False, plots=False)
+        S = train if cfg.train_mode == "fixed" else scenario_winters(cfg_y)
+        gpr = geopolitical_indicator(cfg_y)
+        inst = build_instance(cfg_y, st, spot, fut_hist, fut_hist.loc[lbl], hdd_daily, gpr, S=S)
+        sol = solve(cfg_y, inst, resolve_cmax(cfg_y, inst))
+        row = {"winter": lbl, "g": inst.g, "status": sol.status,
+               "avg_futures": float(inst.F.mean()),
+               "avg_actual_spot": float(actual_winter_spot(cfg_y, y).mean())}
+        if sol.status != "optimal":
+            rows.append(row)
+            continue
+        bt = backtest(cfg_y, inst, sol, hdd_daily)
+        row.update({f"h_{m}": sol.h[m] for m in MONTHS})
+        row.update({k: v for k, v in bt.strategies["realized_cost"].items()})
+        rows.append(row)
+    res = pd.DataFrame(rows).set_index("winter")
+    strat_cols = [c for c in res.columns if c.endswith("hedge") or c in ("Model (optimal)", "Perfect hindsight")]
+    base = res["0% hedge"]
+    summary = pd.DataFrame({
+        "total_cost": res[strat_cols].sum(),
+        "total_vs_no_hedge": res[strat_cols].sub(base, axis=0).sum(),
+        "worst_winter_vs_no_hedge": res[strat_cols].sub(base, axis=0).max(),
+        "best_winter_vs_no_hedge": res[strat_cols].sub(base, axis=0).min(),
+        "std_cost": res[strat_cols].std(),
+        "winters_beating_50pct": (res[strat_cols].lt(res["50% hedge"], axis=0)).sum(),
+    })
+    return res, summary
+
+
+def report_train_test(cfg: Config, st: str, res: pd.DataFrame, summary: pd.DataFrame) -> None:
+    out = cfg.out_dir / f"{st}_train_test_{cfg.train_mode}"
+    out.mkdir(parents=True, exist_ok=True)
+    train_n = cfg.n_train
+    print(f"\n{'=' * 72}\n{STATE_NAMES[st]} ({st}): train/test backtest ({cfg.train_mode} training, "
+          f"first {train_n} winters train, {len(res)} test winters)\n{'=' * 72}")
+    show = res[["g", "avg_futures", "avg_actual_spot"] + [f"h_{m}" for m in MONTHS if f"h_{m}" in res]
+               + ["Model (optimal)", "0% hedge", "50% hedge", "Perfect hindsight"]]
+    print(show.to_string(float_format=lambda v: f"{v:,.2f}" if abs(v) < 100 else f"{v:,.0f}"))
+    print("\nOver all test winters (realized $):")
+    print(summary.to_string(float_format=lambda v: f"{v:,.0f}"))
+    res.to_csv(out / "train_test_by_winter.csv")
+    summary.to_csv(out / "train_test_summary.csv")
+    if cfg.plots:
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+            d = res[["Model (optimal)", "20% hedge", "50% hedge", "80% hedge"]].sub(res["0% hedge"], axis=0) / 1e6
+            fig, ax = plt.subplots(figsize=(8, 4))
+            for c, mk in zip(d.columns, ["o", "s", "^", "v"]):
+                ax.plot(d.index, d[c], marker=mk, lw=2.5 if c.startswith("Model") else 1.2, label=c)
+            ax.axhline(0, color="k", lw=0.8)
+            ax.set_ylabel("Realized cost vs. no hedge ($M)\n(below 0 = hedge saved money)")
+            ax.set_title(f"{st}: out-of-sample test winters")
+            ax.legend(fontsize=8); ax.grid(alpha=.3)
+            fig.tight_layout(); fig.savefig(out / "train_test_costs.png", dpi=150); plt.close(fig)
+        except ImportError:
+            pass
+    print(f"Results written to {out}")
+
+
 # ---------------------------------------------------------------------------
 # 9. Main
 # ---------------------------------------------------------------------------
@@ -802,8 +965,18 @@ def parse_args(argv=None) -> Config:
                    help="Cmax as a multiple of the 50%%-hedge high-price avg cost")
     p.add_argument("--cmax", type=float, default=None, help="absolute Cmax in $ (overrides factor)")
     p.add_argument("--no-cmax", action="store_true", help="drop the high-price cost constraint")
-    p.add_argument("--lower", type=float, nargs=4, default=[0, 0, 0, 0], metavar=("NOV", "DEC", "JAN", "FEB"))
-    p.add_argument("--upper", type=float, nargs=4, default=[1, 1, 1, 1], metavar=("NOV", "DEC", "JAN", "FEB"))
+    p.add_argument("--lower", type=float, nargs=4, default=[0.2] * 4, metavar=("NOV", "DEC", "JAN", "FEB"),
+                   help="policy minimum hedge share per month (default 0.2)")
+    p.add_argument("--upper", type=float, nargs=4, default=[0.8] * 4, metavar=("NOV", "DEC", "JAN", "FEB"),
+                   help="policy maximum hedge share per month (default 0.8)")
+    p.add_argument("--budget-share", type=float, default=0.5,
+                   help="hedging budget as a share of the cost of buying all forecast demand at futures")
+    p.add_argument("--budget", type=float, default=None, help="absolute hedging budget in $")
+    p.add_argument("--no-budget", action="store_true", help="drop the hedging-budget constraint")
+    p.add_argument("--train-test", action="store_true",
+                   help="train on the first --n-train winters and backtest every later winter")
+    p.add_argument("--n-train", type=int, default=20)
+    p.add_argument("--train-mode", choices=["fixed", "expanding"], default="fixed")
     p.add_argument("--futures", type=float, nargs=4, default=None, metavar=("NOV", "DEC", "JAN", "FEB"),
                    help="NYMEX settlements on Oct 1 of the decision year ($/MMBtu)")
     p.add_argument("--gpr-month", default=None, help="default: September of the decision year")
@@ -825,6 +998,9 @@ def parse_args(argv=None) -> Config:
     return Config(
         states=a.states, decision_year=a.decision_year, theta=a.theta, cmax_factor=None if a.no_cmax else a.cmax_factor,
         cmax_abs=None if a.no_cmax else a.cmax, lower=a.lower, upper=a.upper, futures=a.futures,
+        budget_share=None if a.no_budget else a.budget_share,
+        budget_abs=None if a.no_budget else a.budget,
+        train_test=a.train_test, n_train=a.n_train, train_mode=a.train_mode,
         gpr_month=a.gpr_month, force_g=a.force_g, high_basis=a.high_basis,
         scenario_demand=a.scenario_demand,
         companies=dict(c.split("=", 1) for c in a.company), hdd_csv=a.hdd_csv,
@@ -850,6 +1026,12 @@ def main(argv=None) -> None:
     print("Loading weather ...")
     hdd = load_hdd(cfg, cfg.states)
     gpr = geopolitical_indicator(cfg)
+
+    if cfg.train_test:
+        for st in cfg.states:
+            res, summary = train_test(cfg, st, spot, fut_hist, hdd)
+            report_train_test(cfg, st, res, summary)
+        return
 
     for st in cfg.states:
         inst = build_instance(cfg, st, spot, fut_hist, F_now, hdd, gpr)

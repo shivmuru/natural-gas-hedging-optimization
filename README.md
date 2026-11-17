@@ -27,6 +27,9 @@ Common options:
 python gurobi.py --futures 3.10 3.55 3.90 3.70     # Oct 1 2026 CME settlements, Nov Dec Jan Feb ($/MMBtu)
 python gurobi.py --decision-year 2025 --futures NOV DEC JAN FEB   # backtest winter 2025-26 (Oct 1 2025 settlements)
 python gurobi.py --decision-year 2022               # backtest winter 2022-23 (futures taken from the EIA data)
+python gurobi.py --train-test                       # train on the first 20 winters, test on 2017-18 to 2023-24
+python gurobi.py --train-test --train-mode expanding # retrain each test year on every earlier winter
+python gurobi.py --lower 0 0 0 0 --upper 1 1 1 1 --no-budget   # the Milestone 4 model (no policy band, no budget)
 python gurobi.py --states VT --theta 3 --cmax-factor 0.97
 python gurobi.py --lower 0.2 0.2 0.2 0.2 --upper 0.8 0.8 0.8 0.8   # policy hedge band
 python gurobi.py --no-cmax                          # drop the high-price cost constraint
@@ -38,6 +41,10 @@ python gurobi.py --help
 > **Important: the futures strip.** EIA's NYMEX series ends on April 5, 2024, so the decision-date prices F_m for October 1, 2026 aren't in the data. Pass them with `--futures`. If you leave it out, the script uses the latest October strip in the file (Oct 2, 2023) and prints a warning.
 
 ---
+
+## Train/test backtest
+
+`--train-test` (section 13 of the notebook) fits the model on the first 20 winters (1997-98 to 2016-17) and tests it on every later winter (2017-18 to 2023-24). For each test winter the model is solved with that October's futures, using only training information, and scored against actual spot prices and demand. It is compared with fixed 0/20/50/80/100% hedges and a perfect-hindsight hedge within the 20–80% band. `--train-mode fixed` (default) trains once; `expanding` retrains each year on every winter before the test winter. Results go to `outputs/<STATE>_train_test_<mode>/`.
 
 ## Backtesting a past winter
 
@@ -80,7 +87,8 @@ python gurobi.py --help
 | π_s | scenario probability: 1/27, or H × θ then renormalized when g = 1 | – | assumption + GPR |
 | g | 1 if the GPR for September of the decision year is at or above the 90th percentile of monthly GPR since 1985 | binary | Caldara & Iacoviello GPR |
 | θ | weight multiplier on H when g = 1 (default 2) | – | assumption |
-| L_m, U_m | policy bounds on the hedge share (default 0 and 1) | – | assumption |
+| L_m, U_m | policy bounds on the hedge share (default 0.2 and 0.8) | – | assumption |
+| B | hedging budget: the most committed to futures on Oct 1 (default 50% of Σ_m F_m D_m, the cost of hedging all forecast demand) | $ | assumption |
 | C_max | cap on the probability-weighted average cost over H | $ | policy (default = H-average cost of a 50% hedge) |
 | c_s(h) | total Nov–Feb procurement cost in scenario *s* for hedge h (defined below) | $ | cost expression, computed from the parameters above and h |
 
@@ -108,16 +116,20 @@ $$
 subject to
 
 $$
-L_m \le h_m \le U_m \quad \forall m\in M \qquad \text{(hedge policy band; } U_m\le 1 \Rightarrow \text{hedged} \le \text{forecast)}
+L_m \le h_m \le U_m \quad \forall m\in M \qquad \text{(hedge policy band, 20\%–80\% by default)}
+$$
+
+$$
+\sum_{m\in M} F_m D_m h_m \le B \qquad \text{(hedging budget)}
 $$
 
 $$
 \frac{\sum_{s\in H}\pi_s\, c_s(h)}{\sum_{s\in H}\pi_s} \le C_{max} \qquad \text{(high-price winter cost limit)}
 $$
 
-*Implementation:* `gurobi.py` builds this model in collected form, with the four h_m as its only variables and one linear constraint:
+*Implementation:* `gurobi.py` builds this model in collected form, with the four h_m as its only variables and two linear constraints:
 
-min Σ_m (F_m − P̄_m) D_m h_m + K  s.t.  L_m ≤ h_m ≤ U_m,  Σ_m (F_m − P̄^H_m) D_m h_m + K^H ≤ C_max
+min Σ_m (F_m − P̄_m) D_m h_m + K  s.t.  L_m ≤ h_m ≤ U_m,  Σ_m F_m D_m h_m ≤ B,  Σ_m (F_m − P̄^H_m) D_m h_m + K^H ≤ C_max
 
 Here π̃_s = π_s / Σ_{s∈H} π_s (probability of winter s given a high-price winter), P̄_m = Σ_{s∈S} π_s P̃_sm and P̄^H_m = Σ_{s∈H} π̃_s P̃_sm are the expected rescaled spot prices, and K, K^H are the expected no-hedge costs over all winters and over H. Expanding c_s(h) and collecting terms in h gives exactly this form. K does not change the optimal hedge; it is set as the objective constant so the reported objective is the expected cost. Each winter's cost is computed from the optimal h after solving (`cost_s_optimal` in `parameters_scenario.csv`).
 
