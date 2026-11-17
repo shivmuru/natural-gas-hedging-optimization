@@ -42,6 +42,16 @@ python gurobi.py --help
 
 ---
 
+## Milestone 5 analysis
+
+`python m5_analysis.py` runs every Milestone 5 experiment for the October 2, 2023 decision and writes tables and charts to `outputs/m5/`:
+- the C_max trade-off curve (`fig_frontier.png`)
+- a hedging-budget sweep
+- what-if scenarios (geopolitical alert, a January minimum hedge, a tighter budget or risk limit, demand 20% above history, recent history only)
+- post-optimality ranging
+- a Monte Carlo simulation of 10,000 winters (`fig_monte_carlo.png`)
+- the train/test backtest (`fig_train_test.png`)
+
 ## Train/test backtest
 
 `--train-test` (section 13 of the notebook) fits the model on the first 20 winters (1997-98 to 2016-17) and tests it on every later winter (2017-18 to 2023-24). For each test winter the model is solved with that October's futures, using only training information, and scored against actual spot prices and demand. It is compared with fixed 0/20/50/80/100% hedges and a perfect-hindsight hedge within the 20–80% band. `--train-mode fixed` (default) trains once; `expanding` retrains each year on every winter before the test winter. Results go to `outputs/<STATE>_train_test_<mode>/`.
